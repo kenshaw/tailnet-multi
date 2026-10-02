@@ -1,0 +1,106 @@
+#!/bin/bash
+# Manage extra Tailscale tailnets, each in its own userspace tailscaled instance.
+# Usage:
+#   sudo ./tailnet-multi add <vpn host> [<name>] [--hostname H] [--port N] [--socks N] [--ssh-port N] [--no-ssh]
+#   sudo ./tailnet-multi remove <name> [--purge]
+#   ./tailnet-multi list
+#   ./tailnet-multi status <name>
+#   ./tailnet-multi ts <name> <tailscale args...>   # run tailscale against that instance
+set -euo pipefail
+
+CONF=/etc/tailnet-multi
+UNIT_SRC="$(cd "$(dirname "$0")" && pwd)/tailscaled-multi@.service"
+UNIT_DST=/etc/systemd/system/tailscaled-multi@.service
+BASE_PORT=41642   # primary tailscaled uses 41641
+BASE_SOCKS=1055
+
+die() { echo "error: $*" >&2; exit 1; }
+sock() { echo "/run/tailscale-$1/tailscaled.sock"; }
+valid_name() { [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "name must be lowercase alphanumeric/dashes: $1"; }
+default_name() { # vpn.pxl8.cc -> pxl8 (second-to-last label, i.e. without TLD and first hostname)
+  local h=${1#*://}; h=${h%%/*}; h=${h%%:*}
+  local -a l; IFS=. read -ra l <<< "$h"
+  [ ${#l[@]} -ge 2 ] || die "can't derive a name from '$1'; pass one explicitly"
+  echo "${l[${#l[@]}-2]}"
+}
+next_free() { # <var> <base>: lowest value >= base not used by any env file
+  local var=$1 n=$2
+  while grep -qsE "^$var=$n$" "$CONF"/*.env; do n=$((n+1)); done
+  echo "$n"
+}
+
+cmd_add() {
+  [ "$EUID" -eq 0 ] || die "run as root"
+  local server=${1:-} name=""
+  [ -n "$server" ] || die "usage: add <vpn host> [<name>] [options]"
+  shift
+  if [ $# -gt 0 ] && [[ $1 != --* ]]; then name=$1; shift; fi
+  name=${name:-$(default_name "$server")}
+  valid_name "$name"
+  local host="$(hostname -s)-$name" port="" socks="" ssh_port=22 ssh=1
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --hostname) host=$2; shift 2;;
+      --port) port=$2; shift 2;;
+      --socks) socks=$2; shift 2;;
+      --ssh-port) ssh_port=$2; shift 2;;
+      --no-ssh) ssh=0; shift;;
+      *) die "unknown option $1";;
+    esac
+  done
+  [[ $server == http*://* ]] || server="https://$server"
+  mkdir -p "$CONF"
+  [ -e "$CONF/$name.env" ] && die "$name already exists (remove it first)"
+  port=${port:-$(next_free PORT $BASE_PORT)}
+  socks=${socks:-$(next_free SOCKS_PORT $BASE_SOCKS)}
+  cat > "$CONF/$name.env" <<ENV
+LOGIN_SERVER=$server
+TS_HOSTNAME=$host
+PORT=$port
+SOCKS_PORT=$socks
+SSH=$ssh
+SSH_PORT=$ssh_port
+ENV
+  install -m 644 "$UNIT_SRC" "$UNIT_DST"
+  systemctl daemon-reload
+  systemctl enable --now "tailscaled-multi@$name"
+  local ts="tailscale --socket=$(sock "$name")"
+  # Prints a login URL / registration key and blocks until the node is approved.
+  $ts up --login-server="$server" --hostname="$host" --accept-dns=false --accept-routes=false
+  if [ "$ssh" = 1 ]; then
+    $ts serve --bg --tcp "$ssh_port" "tcp://localhost:$ssh_port"
+  fi
+  $ts status
+}
+
+cmd_remove() {
+  [ "$EUID" -eq 0 ] || die "run as root"
+  local name=${1:-} purge=${2:-}
+  valid_name "$name"
+  systemctl disable --now "tailscaled-multi@$name" || true
+  rm -f "$CONF/$name.env"
+  [ "$purge" = --purge ] && rm -rf "/var/lib/tailscale-$name"
+  echo "removed $name${purge:+ (state purged)}"
+}
+
+cmd_list() {
+  shopt -s nullglob
+  printf '%-12s %-32s %-6s %-6s %s\n' NAME LOGIN_SERVER PORT SOCKS ACTIVE
+  for f in "$CONF"/*.env; do
+    n=$(basename "$f" .env)
+    # shellcheck disable=SC1090
+    ( . "$f"; printf '%-12s %-32s %-6s %-6s %s\n' "$n" "$LOGIN_SERVER" "$PORT" "$SOCKS_PORT" \
+        "$(systemctl is-active "tailscaled-multi@$n")" )
+  done
+}
+
+cmd_ts() { local n=$1; shift; valid_name "$n"; exec tailscale --socket="$(sock "$n")" "$@"; }
+
+case ${1:-} in
+  add) shift; cmd_add "$@";;
+  remove) shift; cmd_remove "$@";;
+  list) cmd_list;;
+  status) shift; cmd_ts "${1:?name}" status;;
+  ts) shift; cmd_ts "$@";;
+  *) sed -n '2,9p' "$0"; exit 1;;
+esac

@@ -1,0 +1,20 @@
+[Unit]
+Description=Tailscale node agent (%i tailnet, userspace)
+Documentation=https://tailscale.com/docs/
+Wants=network-pre.target
+After=network-pre.target
+
+[Service]
+EnvironmentFile=/etc/tailnet-multi/%i.env
+ExecStart=/usr/sbin/tailscaled --tun=userspace-networking --state=/var/lib/tailscale-%i/tailscaled.state --socket=/run/tailscale-%i/tailscaled.sock --port=${PORT} --socks5-server=localhost:${SOCKS_PORT}
+Restart=on-failure
+RuntimeDirectory=tailscale-%i
+RuntimeDirectoryMode=0755
+StateDirectory=tailscale-%i
+StateDirectoryMode=0700
+CacheDirectory=tailscale-%i
+CacheDirectoryMode=0750
+Type=notify
+
+[Install]
+WantedBy=multi-user.target
