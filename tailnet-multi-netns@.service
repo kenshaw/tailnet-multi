@@ -1,0 +1,12 @@
+[Unit]
+Description=Network namespace for the %i tailnet (routed mode)
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tailnet-multi netns-up %i
+ExecStop=/usr/local/bin/tailnet-multi netns-down %i
+
+[Install]
+WantedBy=multi-user.target

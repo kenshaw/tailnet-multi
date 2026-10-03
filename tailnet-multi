@@ -1,16 +1,19 @@
 #!/bin/bash
-# Manage extra Tailscale tailnets, each in its own userspace tailscaled instance.
+# Manage extra Tailscale tailnets, each in its own tailscaled instance.
 # Usage:
-#   sudo ./tailnet-multi add <vpn host> [<name>] [--hostname H] [--port N] [--socks N] [--ssh-port N] [--no-ssh]
+#   sudo ./tailnet-multi add <vpn host> [<name>] [--hostname H] [--port N] [--socks N] [--ssh-port N] [--no-ssh] [--route CIDR]...
 #   sudo ./tailnet-multi remove <name> [--purge]
 #   ./tailnet-multi list
 #   ./tailnet-multi status <name>
 #   ./tailnet-multi ts <name> <tailscale args...>   # run tailscale against that instance
+# --route switches the instance to routed mode (own netns + TUN); only those CIDRs reach it.
 set -euo pipefail
 
 CONF=/etc/tailnet-multi
-UNIT_SRC="$(cd "$(dirname "$0")" && pwd)/tailscaled-multi@.service"
-UNIT_DST=/etc/systemd/system/tailscaled-multi@.service
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$(readlink -f "$0")"
+BIN=/usr/local/bin/tailnet-multi
+UNIT_DST=/etc/systemd/system
 BASE_PORT=41642   # primary tailscaled uses 41641
 BASE_SOCKS=1055
 
@@ -28,6 +31,10 @@ next_free() { # <var> <base>: lowest value >= base not used by any env file
   while grep -qsE "^$var=$n$" "$CONF"/*.env; do n=$((n+1)); done
   echo "$n"
 }
+load_env() { [ -f "$CONF/$1.env" ] || die "no such tailnet: $1"; . "$CONF/$1.env"; }
+unit_for() { # <name>: tailscaled unit for that instance's mode
+  ( load_env "$1"; [ "${MODE:-userspace}" = routed ] && echo "tailscaled-multi-route@$1" || echo "tailscaled-multi@$1" )
+}
 
 cmd_add() {
   [ "$EUID" -eq 0 ] || die "run as root"
@@ -37,7 +44,7 @@ cmd_add() {
   if [ $# -gt 0 ] && [[ $1 != --* ]]; then name=$1; shift; fi
   name=${name:-$(default_name "$server")}
   valid_name "$name"
-  local host="$(hostname -s)-$name" port="" socks="" ssh_port=22 ssh=1
+  local host="$(hostname -s)-$name" port="" socks="" ssh_port=22 ssh=1 routes="" r
   while [ $# -gt 0 ]; do
     case $1 in
       --hostname) host=$2; shift 2;;
@@ -45,6 +52,8 @@ cmd_add() {
       --socks) socks=$2; shift 2;;
       --ssh-port) ssh_port=$2; shift 2;;
       --no-ssh) ssh=0; shift;;
+      --route) [[ ${2:-} =~ ^[0-9.]+/[0-9]+$ ]] || die "--route needs an IPv4 CIDR, e.g. 10.0.0.0/8"
+               routes=${routes:+$routes,}$2; shift 2;;
       *) die "unknown option $1";;
     esac
   done
@@ -52,7 +61,17 @@ cmd_add() {
   mkdir -p "$CONF"
   [ -e "$CONF/$name.env" ] && die "$name already exists (remove it first)"
   port=${port:-$(next_free PORT $BASE_PORT)}
-  socks=${socks:-$(next_free SOCKS_PORT $BASE_SOCKS)}
+  local mode=userspace idx=0 unit="tailscaled-multi@$name" ssh_target="tcp://localhost:$ssh_port" accept_routes=false
+  if [ -n "$routes" ]; then
+    mode=routed
+    idx=$(next_free IDX 1)
+    socks=0
+    unit="tailscaled-multi-route@$name"
+    ssh_target="tcp://198.18.$idx.1:$ssh_port"
+    accept_routes=true
+  else
+    socks=${socks:-$(next_free SOCKS_PORT $BASE_SOCKS)}
+  fi
   cat > "$CONF/$name.env" <<ENV
 LOGIN_SERVER=$server
 TS_HOSTNAME=$host
@@ -60,15 +79,23 @@ PORT=$port
 SOCKS_PORT=$socks
 SSH=$ssh
 SSH_PORT=$ssh_port
+MODE=$mode
+IDX=$idx
+ROUTES=$routes
 ENV
-  install -m 644 "$UNIT_SRC" "$UNIT_DST"
+  if [ "$mode" = routed ]; then
+    [ "$SELF" = "$BIN" ] || install -m 755 "$SELF" "$BIN"
+    install -m 644 "$SRC_DIR/tailnet-multi-netns@.service" "$SRC_DIR/tailscaled-multi-route@.service" "$UNIT_DST/"
+  else
+    install -m 644 "$SRC_DIR/tailscaled-multi@.service" "$UNIT_DST/"
+  fi
   systemctl daemon-reload
-  systemctl enable --now "tailscaled-multi@$name"
+  systemctl enable --now "$unit"
   local ts="tailscale --socket=$(sock "$name")"
   # Prints a login URL / registration key and blocks until the node is approved.
-  $ts up --login-server="$server" --hostname="$host" --accept-dns=false --accept-routes=false
+  $ts up --login-server="$server" --hostname="$host" --accept-dns=false --accept-routes=$accept_routes
   if [ "$ssh" = 1 ]; then
-    $ts serve --bg --tcp "$ssh_port" "tcp://localhost:$ssh_port"
+    $ts serve --bg --tcp "$ssh_port" "$ssh_target"
   fi
   $ts status
 }
@@ -77,7 +104,9 @@ cmd_remove() {
   [ "$EUID" -eq 0 ] || die "run as root"
   local name=${1:-} purge=${2:-}
   valid_name "$name"
-  systemctl disable --now "tailscaled-multi@$name" || true
+  local unit; unit=$(unit_for "$name")
+  systemctl disable --now "$unit" || true
+  systemctl disable --now "tailnet-multi-netns@$name" 2>/dev/null || true
   rm -f "$CONF/$name.env"
   [ "$purge" = --purge ] && rm -rf "/var/lib/tailscale-$name"
   echo "removed $name${purge:+ (state purged)}"
@@ -85,13 +114,59 @@ cmd_remove() {
 
 cmd_list() {
   shopt -s nullglob
-  printf '%-12s %-32s %-6s %-6s %s\n' NAME LOGIN_SERVER PORT SOCKS ACTIVE
+  printf '%-12s %-32s %-6s %-18s %s\n' NAME LOGIN_SERVER PORT SOCKS/ROUTES ACTIVE
   for f in "$CONF"/*.env; do
     n=$(basename "$f" .env)
     # shellcheck disable=SC1090
-    ( . "$f"; printf '%-12s %-32s %-6s %-6s %s\n' "$n" "$LOGIN_SERVER" "$PORT" "$SOCKS_PORT" \
-        "$(systemctl is-active "tailscaled-multi@$n")" )
+    ( . "$f"; printf '%-12s %-32s %-6s %-18s %s\n' "$n" "$LOGIN_SERVER" "$PORT" \
+        "${ROUTES:-$SOCKS_PORT}" "$(systemctl is-active "$(unit_for "$n")")" )
   done
+}
+
+# Routed mode: netns tsm-<name> joined to the host by a /30 veth (198.18.IDX.0/30,
+# host .1, netns .2). Host routes only ROUTES via the netns, which NATs into tailscale0.
+cmd_netns_down() {
+  local n=$1; load_env "$n"
+  local r
+  for r in ${ROUTES//,/ }; do ip route del "$r" via "198.18.$IDX.2" 2>/dev/null || true; done
+  nft delete table ip "tsm$IDX" 2>/dev/null || true
+  ip link del "tsmh$IDX" 2>/dev/null || true
+  ip netns del "tsm-$n" 2>/dev/null || true
+}
+
+cmd_netns_up() {
+  local n=$1; load_env "$n"
+  cmd_netns_down "$n"
+  modprobe veth || die "veth module unavailable (kernel updated without reboot?)"
+  local ns=tsm-$n h=tsmh$IDX p=tsmn$IDX hip=198.18.$IDX.1 nip=198.18.$IDX.2 r
+  ip netns add "$ns"
+  ip link add "$h" type veth peer name "$p" netns "$ns"
+  ip addr add "$hip/30" dev "$h"
+  ip link set "$h" up
+  ip -n "$ns" addr add "$nip/30" dev "$p"
+  ip -n "$ns" link set "$p" up
+  ip -n "$ns" link set lo up
+  ip -n "$ns" route add default via "$hip"
+  ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
+  ip netns exec "$ns" nft -f - <<NFT
+table ip tsm {
+  chain post { type nat hook postrouting priority srcnat; oifname "tailscale0" masquerade; }
+  chain mss { type filter hook forward priority mangle; tcp flags syn tcp option maxseg size set rt mtu; }
+}
+NFT
+  # The netns's own traffic (control server, DERP, direct UDP) leaves via the host.
+  sysctl -qw net.ipv4.ip_forward=1
+  nft -f - <<NFT
+table ip tsm$IDX { chain post { type nat hook postrouting priority srcnat; iifname "$h" oifname != "$h" masquerade; }; }
+NFT
+  # tailscaled's DNS lookups must not hit a host-only stub like 127.0.0.53.
+  mkdir -p "/etc/netns/$ns"
+  if [ -s /run/systemd/resolve/resolv.conf ]; then
+    cp /run/systemd/resolve/resolv.conf "/etc/netns/$ns/resolv.conf"
+  else
+    cp /etc/resolv.conf "/etc/netns/$ns/resolv.conf"
+  fi
+  for r in ${ROUTES//,/ }; do ip route replace "$r" via "$nip" dev "$h"; done
 }
 
 cmd_ts() { local n=$1; shift; valid_name "$n"; exec tailscale --socket="$(sock "$n")" "$@"; }
@@ -102,5 +177,7 @@ case ${1:-} in
   list) cmd_list;;
   status) shift; cmd_ts "${1:?name}" status;;
   ts) shift; cmd_ts "$@";;
-  *) sed -n '2,9p' "$0"; exit 1;;
+  netns-up) cmd_netns_up "${2:?name}";;
+  netns-down) cmd_netns_down "${2:?name}";;
+  *) sed -n '2,10p' "$0"; exit 1;;
 esac
