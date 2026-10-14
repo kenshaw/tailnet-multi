@@ -134,6 +134,15 @@ cmd_netns_down() {
   ip netns del "tsm-$n" 2>/dev/null || true
 }
 
+# tailscaled's DNS lookups must not hit a host-only stub like 127.0.0.53. Copy in place
+# (same inode) so the bind mount in tailscaled-multi-route@ sees updates.
+cmd_netns_dns() {
+  local ns=tsm-$1 src=/etc/resolv.conf
+  [ -s /run/systemd/resolve/resolv.conf ] && src=/run/systemd/resolve/resolv.conf
+  mkdir -p "/etc/netns/$ns"
+  cat "$src" > "/etc/netns/$ns/resolv.conf"
+}
+
 cmd_netns_up() {
   local n=$1; load_env "$n"
   cmd_netns_down "$n"
@@ -159,13 +168,7 @@ NFT
   nft -f - <<NFT
 table ip tsm$IDX { chain post { type nat hook postrouting priority srcnat; iifname "$h" oifname != "$h" masquerade; }; }
 NFT
-  # tailscaled's DNS lookups must not hit a host-only stub like 127.0.0.53.
-  mkdir -p "/etc/netns/$ns"
-  if [ -s /run/systemd/resolve/resolv.conf ]; then
-    cp /run/systemd/resolve/resolv.conf "/etc/netns/$ns/resolv.conf"
-  else
-    cp /etc/resolv.conf "/etc/netns/$ns/resolv.conf"
-  fi
+  cmd_netns_dns "$n"
   for r in ${ROUTES//,/ }; do ip route replace "$r" via "$nip" dev "$h"; done
 }
 
@@ -179,5 +182,6 @@ case ${1:-} in
   ts) shift; cmd_ts "$@";;
   netns-up) cmd_netns_up "${2:?name}";;
   netns-down) cmd_netns_down "${2:?name}";;
+  netns-dns) cmd_netns_dns "${2:?name}";;
   *) sed -n '2,10p' "$0"; exit 1;;
 esac

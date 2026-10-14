@@ -1,8 +1,8 @@
 [Unit]
 Description=Tailscale node agent (%i tailnet, routed netns)
 Documentation=https://tailscale.com/docs/
-Wants=network-pre.target
-After=network-pre.target tailnet-multi-netns@%i.service
+Wants=network-online.target
+After=network-online.target systemd-resolved.service tailnet-multi-netns@%i.service
 Requires=tailnet-multi-netns@%i.service
 
 [Service]
@@ -10,6 +10,7 @@ EnvironmentFile=/etc/tailnet-multi/%i.env
 NetworkNamespacePath=/run/netns/tsm-%i
 BindReadOnlyPaths=/etc/netns/tsm-%i/resolv.conf:/etc/resolv.conf
 ExecStartPre=-/usr/sbin/modprobe tun
+ExecStartPre=/usr/local/bin/tailnet-multi netns-dns %i
 ExecStart=/usr/sbin/tailscaled --state=/var/lib/tailscale-%i/tailscaled.state --socket=/run/tailscale-%i/tailscaled.sock --port=${PORT}
 Restart=on-failure
 RuntimeDirectory=tailscale-%i

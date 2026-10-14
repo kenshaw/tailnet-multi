@@ -1,6 +1,7 @@
 [Unit]
 Description=Network namespace for the %i tailnet (routed mode)
-After=network-pre.target
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
